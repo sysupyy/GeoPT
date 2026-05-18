@@ -1,0 +1,26 @@
+python run.py \
+  --gpu 2 \
+  --data_path ./aircraft_npys \
+  --loader AirCraft \
+  --task GeoPT_finetune \
+  --dynamics craft \
+  --geotype unstructured \
+  --space_dim 3 \
+  --fun_dim 11 \
+  --out_dim 6 \
+  --normalize 1 \
+  --model Transolver \
+  --n_hidden 256 \
+  --n_heads 8 \
+  --n_layers 8 \
+  --mlp_ratio 2 \
+  --slice_num 32 \
+  --ntrain 100 \
+  --ntest 50 \
+  --batch-size 1 \
+  --lora_lr 1e-3 \
+  --epochs 100 \
+  --stage 2 \
+  --finetune 1 \
+  --finetune_name my_stage1_backbone3 \
+  --save_name my_stage2_final_lora

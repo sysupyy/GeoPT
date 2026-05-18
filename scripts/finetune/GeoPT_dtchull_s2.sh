@@ -1,0 +1,26 @@
+python run.py \
+--gpu 1 \
+--data_path ./dtchull_npys \
+--loader DTCHull \
+--task GeoPT_finetune \
+--dynamics hull \
+--geotype unstructured \
+--space_dim 3 \
+--fun_dim 11 \
+--out_dim 4 \
+--normalize 1 \
+--model Transolver \
+--n_hidden 256 \
+--n_heads 8 \
+--n_layers 8 \
+--mlp_ratio 2 \
+--slice_num 32 \
+--ntrain 100 \
+--ntest 20 \
+--batch-size 1 \
+--lora_lr 1e-4 \
+--epochs 100 \
+--stage 2 \
+--finetune 1 \
+--finetune_name my_stage1_backbone_hull2 \
+--save_name my_stage2_final_lora_hull
