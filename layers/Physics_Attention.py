@@ -6,7 +6,8 @@ import numpy as np
 
 class Physics_Attention_Irregular_Mesh(nn.Module):
     ## for irregular meshes in 1D, 2D or 3D space
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0., slice_num=64, shapelist=None):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0., slice_num=64, shapelist=None,
+                 use_local_adaptive_slice=False, local_slice_strength=1.0):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
@@ -15,10 +16,29 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
+        self.use_local_adaptive_slice = bool(use_local_adaptive_slice)
+        self.local_slice_strength = nn.Parameter(torch.tensor(float(local_slice_strength)))
 
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
+        if self.use_local_adaptive_slice:
+            self.local_slice_bias = nn.Sequential(
+                nn.LayerNorm(dim_head),
+                nn.Linear(dim_head, dim_head),
+                nn.GELU(),
+                nn.Linear(dim_head, slice_num)
+            )
+            self.context_to_slice = nn.Sequential(
+                nn.LayerNorm(dim),
+                nn.Linear(dim, inner_dim),
+                nn.GELU(),
+                nn.Linear(inner_dim, heads * slice_num)
+            )
+            nn.init.zeros_(self.local_slice_bias[-1].weight)
+            nn.init.zeros_(self.local_slice_bias[-1].bias)
+            nn.init.zeros_(self.context_to_slice[-1].weight)
+            nn.init.zeros_(self.context_to_slice[-1].bias)
         for l in [self.in_project_slice]:
             torch.nn.init.orthogonal_(l.weight)  # use a principled initialization
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
@@ -29,7 +49,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, return_feature=False, vis=False):
+    def forward(self, x, return_feature=False, vis=False, context=None):
         # B N C
         B, N, C = x.shape
 
@@ -38,7 +58,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             .permute(0, 2, 1, 3).contiguous()  # B H N C
         x_mid = self.in_project_x(x).reshape(B, N, self.heads, self.dim_head) \
             .permute(0, 2, 1, 3).contiguous()  # B H N C
-        slice_weights = self.softmax(self.in_project_slice(x_mid) / self.temperature)  # B H N G
+        slice_logits = self.in_project_slice(x_mid)
+        if self.use_local_adaptive_slice:
+            local_bias = self.local_slice_bias(x_mid)
+            slice_logits = slice_logits + self.local_slice_strength * local_bias
+            if context is not None:
+                context_bias = self.context_to_slice(context).reshape(B, self.heads, 1, -1)
+                slice_logits = slice_logits + self.local_slice_strength * context_bias
+        slice_weights = self.softmax(slice_logits / self.temperature)  # B H N G
         if vis:
             np.save("slice_weights.npy", slice_weights.detach().cpu().numpy())
         slice_norm = slice_weights.sum(2)  # B H G
@@ -91,7 +118,7 @@ class Physics_Attention_Structured_Mesh_1D(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x, return_feature=False):
+    def forward(self, x, return_feature=False, context=None):
         # B N C
         B, N, C = x.shape
         x = x.reshape(B, self.length, C).contiguous().permute(0, 2, 1).contiguous()  # B C N
@@ -153,7 +180,7 @@ class Physics_Attention_Structured_Mesh_2D(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         # B N C
         B, N, C = x.shape
         x = x.reshape(B, self.H, self.W, C).contiguous().permute(0, 3, 1, 2).contiguous()  # B C H W
@@ -212,7 +239,7 @@ class Physics_Attention_Structured_Mesh_3D(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, x):
+    def forward(self, x, context=None):
         # B N C
         B, N, C = x.shape
         x = x.reshape(B, self.H, self.W, self.D, C).contiguous().permute(0, 4, 1, 2, 3).contiguous()  # B C H W

@@ -51,6 +51,15 @@ parser.add_argument('--checkpoint', type=int, default=0, help='using gradient ch
 
 ## model specific configuration
 parser.add_argument('--slice_num', type=int, default=32, help='number of physical states for Transolver')
+parser.add_argument('--use_geo_film', type=int, default=0,
+                    help='use geometry-conditioned FiLM on Transolver residual branches')
+parser.add_argument('--geo_film_hidden', type=int, default=128, help='hidden dim for geometry context encoder')
+parser.add_argument('--geo_film_strength', type=float, default=0.1,
+                    help='initial scale for geometry FiLM residual modulation')
+parser.add_argument('--use_local_adaptive_slice', type=int, default=0,
+                    help='use geometry-conditioned local adaptive slice bias in Physics-Attention')
+parser.add_argument('--local_slice_strength', type=float, default=1.0,
+                    help='initial scale for adaptive slice bias')
 
 ## eval
 parser.add_argument('--eval', type=int, default=0, help='evaluation or not')
