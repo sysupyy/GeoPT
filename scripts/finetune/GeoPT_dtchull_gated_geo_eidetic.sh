@@ -1,5 +1,5 @@
 python run.py \
---gpu 1 \
+--gpu 2 \
 --data_path ./dtchull_npys \
 --loader DTCHull \
 --task GeoPT_finetune \
@@ -15,16 +15,18 @@ python run.py \
 --n_layers 8 \
 --mlp_ratio 2 \
 --slice_num 32 \
+--physics_mixer gated_linear \
+--use_eidetic_slice 1 \
+--use_local_adaptive_slice 1 \
+--local_slice_strength 1.0 \
 --use_geo_film 1 \
 --geo_film_hidden 128 \
 --geo_film_strength 0.1 \
---use_local_adaptive_slice 1 \
---local_slice_strength 1.0 \
 --ntrain 100 \
 --ntest 20 \
 --batch-size 1 \
 --epochs 200 \
 --eval 0 \
---save_name hull_geopt_transolver_geo_slice \
+--save_name hull_geopt_transolver_gated_geo_eidetic \
 --finetune 1 \
 --finetune_name GeoPT_8layers

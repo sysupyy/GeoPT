@@ -60,6 +60,17 @@ parser.add_argument('--use_local_adaptive_slice', type=int, default=0,
                     help='use geometry-conditioned local adaptive slice bias in Physics-Attention')
 parser.add_argument('--local_slice_strength', type=float, default=1.0,
                     help='initial scale for adaptive slice bias')
+parser.add_argument('--physics_mixer', type=str, default='transolver',
+                    choices=['transolver', 'linearno', 'gated_linear'],
+                    help='physical-state token mixer: original Transolver attention or LinearNO-style variants')
+parser.add_argument('--use_eidetic_slice', type=int, default=0,
+                    help='use Transolver++ style adaptive temperature for eidetic physical states')
+parser.add_argument('--eidetic_min_temp', type=float, default=0.01,
+                    help='minimum temperature for eidetic slice assignment')
+parser.add_argument('--eidetic_gumbel', type=int, default=0,
+                    help='use Gumbel-softmax slice assignment during training')
+parser.add_argument('--eidetic_hard', type=int, default=0,
+                    help='use straight-through hard Gumbel slice assignment')
 
 ## eval
 parser.add_argument('--eval', type=int, default=0, help='evaluation or not')

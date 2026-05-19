@@ -128,7 +128,12 @@ class Transolver_block(nn.Module):
             use_geo_film=False,
             geo_film_strength=0.1,
             use_local_adaptive_slice=False,
-            local_slice_strength=1.0
+            local_slice_strength=1.0,
+            physics_mixer='transolver',
+            use_eidetic_slice=False,
+            eidetic_min_temp=0.01,
+            eidetic_gumbel=False,
+            eidetic_hard=False
     ):
         super().__init__()
         self.last_layer = last_layer
@@ -138,7 +143,12 @@ class Transolver_block(nn.Module):
         attn_kwargs = {}
         if geotype == 'unstructured':
             attn_kwargs.update(dict(use_local_adaptive_slice=use_local_adaptive_slice,
-                                    local_slice_strength=local_slice_strength))
+                                    local_slice_strength=local_slice_strength,
+                                    physics_mixer=physics_mixer,
+                                    use_eidetic_slice=use_eidetic_slice,
+                                    eidetic_min_temp=eidetic_min_temp,
+                                    eidetic_gumbel=eidetic_gumbel,
+                                    eidetic_hard=eidetic_hard))
         self.Attn = PHYSICS_ATTENTION[geotype](hidden_dim, heads=num_heads, dim_head=hidden_dim // num_heads,
                                                dropout=dropout, slice_num=slice_num, shapelist=shapelist,
                                                **attn_kwargs)
@@ -177,6 +187,7 @@ class Model(nn.Module):
                               n_layers=0, res=False, act=args.act)
         self.use_geo_film = bool(getattr(args, 'use_geo_film', 0))
         self.use_local_adaptive_slice = bool(getattr(args, 'use_local_adaptive_slice', 0))
+        self.use_eidetic_slice = bool(getattr(args, 'use_eidetic_slice', 0))
         if self.use_geo_film or self.use_local_adaptive_slice:
             self.geo_context = GeometryContextEncoder(args.space_dim, args.fun_dim, args.n_hidden,
                                                       getattr(args, 'geo_film_hidden', args.n_hidden),
@@ -197,7 +208,12 @@ class Model(nn.Module):
                                                       use_geo_film=self.use_geo_film,
                                                       geo_film_strength=getattr(args, 'geo_film_strength', 0.1),
                                                       use_local_adaptive_slice=self.use_local_adaptive_slice,
-                                                      local_slice_strength=getattr(args, 'local_slice_strength', 1.0))
+                                                      local_slice_strength=getattr(args, 'local_slice_strength', 1.0),
+                                                      physics_mixer=getattr(args, 'physics_mixer', 'transolver'),
+                                                      use_eidetic_slice=self.use_eidetic_slice,
+                                                      eidetic_min_temp=getattr(args, 'eidetic_min_temp', 0.01),
+                                                      eidetic_gumbel=bool(getattr(args, 'eidetic_gumbel', 0)),
+                                                      eidetic_hard=bool(getattr(args, 'eidetic_hard', 0)))
                                      for _ in range(args.n_layers)])
         self.placeholder = nn.Parameter((1 / (args.n_hidden)) * torch.rand(args.n_hidden, dtype=torch.float))
         self.initialize_weights()
@@ -216,6 +232,12 @@ class Model(nn.Module):
             if hasattr(module, 'context_to_slice'):
                 nn.init.zeros_(module.context_to_slice[-1].weight)
                 nn.init.zeros_(module.context_to_slice[-1].bias)
+            if hasattr(module, 'proj_temperature'):
+                nn.init.zeros_(module.proj_temperature[-1].weight)
+                nn.init.zeros_(module.proj_temperature[-1].bias)
+            if hasattr(module, 'token_gate'):
+                nn.init.zeros_(module.token_gate[-2].weight)
+                nn.init.zeros_(module.token_gate[-2].bias)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

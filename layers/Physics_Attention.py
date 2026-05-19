@@ -1,18 +1,37 @@
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 from einops import rearrange, repeat
 import numpy as np
+
+
+def gumbel_softmax(logits, tau, hard=False, dim=-1):
+    noise = torch.rand_like(logits)
+    noise = -torch.log(-torch.log(noise + 1e-8) + 1e-8)
+    y = F.softmax((logits + noise) / tau, dim=dim)
+    if hard:
+        index = y.max(dim=dim, keepdim=True)[1]
+        y_hard = torch.zeros_like(logits).scatter_(dim, index, 1.0)
+        y = (y_hard - y).detach() + y
+    return y
 
 
 class Physics_Attention_Irregular_Mesh(nn.Module):
     ## for irregular meshes in 1D, 2D or 3D space
     def __init__(self, dim, heads=8, dim_head=64, dropout=0., slice_num=64, shapelist=None,
-                 use_local_adaptive_slice=False, local_slice_strength=1.0):
+                 use_local_adaptive_slice=False, local_slice_strength=1.0,
+                 physics_mixer='transolver', use_eidetic_slice=False,
+                 eidetic_min_temp=0.01, eidetic_gumbel=False, eidetic_hard=False):
         super().__init__()
         inner_dim = dim_head * heads
         self.dim_head = dim_head
         self.heads = heads
         self.scale = dim_head ** -0.5
+        self.physics_mixer = physics_mixer
+        self.use_eidetic_slice = bool(use_eidetic_slice)
+        self.eidetic_min_temp = float(eidetic_min_temp)
+        self.eidetic_gumbel = bool(eidetic_gumbel)
+        self.eidetic_hard = bool(eidetic_hard)
         self.softmax = nn.Softmax(dim=-1)
         self.dropout = nn.Dropout(dropout)
         self.temperature = nn.Parameter(torch.ones([1, heads, 1, 1]) * 0.5)
@@ -22,6 +41,12 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.in_project_x = nn.Linear(dim, inner_dim)
         self.in_project_fx = nn.Linear(dim, inner_dim)
         self.in_project_slice = nn.Linear(dim_head, slice_num)
+        if self.use_eidetic_slice:
+            self.proj_temperature = nn.Sequential(
+                nn.Linear(dim_head, slice_num),
+                nn.GELU(),
+                nn.Linear(slice_num, 1)
+            )
         if self.use_local_adaptive_slice:
             self.local_slice_bias = nn.Sequential(
                 nn.LayerNorm(dim_head),
@@ -44,6 +69,18 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.to_q = nn.Linear(dim_head, dim_head, bias=False)
         self.to_k = nn.Linear(dim_head, dim_head, bias=False)
         self.to_v = nn.Linear(dim_head, dim_head, bias=False)
+        if self.physics_mixer == 'gated_linear':
+            self.token_gate = nn.Sequential(
+                nn.LayerNorm(dim_head),
+                nn.Linear(dim_head, dim_head),
+                nn.GELU(),
+                nn.Linear(dim_head, dim_head),
+                nn.Sigmoid()
+            )
+            nn.init.zeros_(self.token_gate[-2].weight)
+            nn.init.zeros_(self.token_gate[-2].bias)
+        elif self.physics_mixer not in ['transolver', 'linearno']:
+            raise ValueError(f"Unknown physics_mixer='{self.physics_mixer}'")
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
@@ -65,21 +102,43 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             if context is not None:
                 context_bias = self.context_to_slice(context).reshape(B, self.heads, 1, -1)
                 slice_logits = slice_logits + self.local_slice_strength * context_bias
-        slice_weights = self.softmax(slice_logits / self.temperature)  # B H N G
+        if self.use_eidetic_slice:
+            temperature = torch.clamp(self.proj_temperature(x_mid) + self.temperature,
+                                      min=self.eidetic_min_temp)
+        else:
+            temperature = self.temperature
+
+        if self.use_eidetic_slice and self.eidetic_gumbel and self.training:
+            slice_weights = gumbel_softmax(slice_logits, temperature, hard=self.eidetic_hard, dim=-1)
+        else:
+            slice_weights = self.softmax(slice_logits / temperature)  # B H N G
         if vis:
             np.save("slice_weights.npy", slice_weights.detach().cpu().numpy())
         slice_norm = slice_weights.sum(2)  # B H G
         slice_token = torch.einsum("bhnc,bhng->bhgc", fx_mid, slice_weights)
         slice_token = slice_token / ((slice_norm + 1e-5)[:, :, :, None].repeat(1, 1, 1, self.dim_head))
 
-        ### (2) Attention among slice tokens
-        q_slice_token = self.to_q(slice_token)
-        k_slice_token = self.to_k(slice_token)
-        v_slice_token = self.to_v(slice_token)
-        dots = torch.matmul(q_slice_token, k_slice_token.transpose(-1, -2)) * self.scale
-        attn = self.softmax(dots)
-        attn = self.dropout(attn)
-        out_slice_token = torch.matmul(attn, v_slice_token)  # B H G D
+        ### (2) Mixing among physical states
+        if self.physics_mixer == 'transolver':
+            q_slice_token = self.to_q(slice_token)
+            k_slice_token = self.to_k(slice_token)
+            v_slice_token = self.to_v(slice_token)
+            if hasattr(F, 'scaled_dot_product_attention'):
+                out_slice_token = F.scaled_dot_product_attention(
+                    q_slice_token, k_slice_token, v_slice_token,
+                    dropout_p=self.dropout.p if self.training else 0.0
+                )
+            else:
+                dots = torch.matmul(q_slice_token, k_slice_token.transpose(-1, -2)) * self.scale
+                attn = self.softmax(dots)
+                attn = self.dropout(attn)
+                out_slice_token = torch.matmul(attn, v_slice_token)  # B H G D
+        elif self.physics_mixer == 'linearno':
+            out_slice_token = self.to_v(slice_token)
+        else:
+            value = self.to_v(slice_token)
+            gate = self.token_gate(slice_token)
+            out_slice_token = gate * value + (1.0 - gate) * slice_token
 
         ### (3) Deslice
         out_x = torch.einsum("bhgc,bhng->bhnc", out_slice_token, slice_weights)
