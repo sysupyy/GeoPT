@@ -71,6 +71,27 @@ parser.add_argument('--eidetic_gumbel', type=int, default=0,
                     help='use Gumbel-softmax slice assignment during training')
 parser.add_argument('--eidetic_hard', type=int, default=0,
                     help='use straight-through hard Gumbel slice assignment')
+parser.add_argument('--use_condition_adapter', type=int, default=0,
+                    help='enable zero-init downstream condition adapters inside Transolver hidden blocks')
+parser.add_argument('--adapter_layers', type=str, default='1,3,5',
+                    help='comma-separated hidden block indices where condition adapters are injected')
+parser.add_argument('--adapter_hidden_dim', type=int, default=128,
+                    help='hidden width for downstream condition adapters')
+parser.add_argument('--adapter_condition_source', type=str, default='x_fx',
+                    choices=['x', 'fx', 'x_fx'],
+                    help='condition features used by adapters')
+parser.add_argument('--lambda_adapter', type=float, default=0.0,
+                    help='optional L2 regularization weight for adapter residuals')
+parser.add_argument('--use_output_residual_head', type=int, default=0,
+                    help='enable zero-init output residual head conditioned on hidden states and input features')
+parser.add_argument('--output_residual_hidden', type=int, default=256,
+                    help='hidden width for the output residual head')
+parser.add_argument('--use_prompt_nonlocal', type=int, default=0,
+                    help='enable zero-init non-local token mixer inside the prompt-side dynamics MLP')
+parser.add_argument('--prompt_nonlocal_context', type=int, default=128,
+                    help='number of context tokens sampled by prompt non-local mixer')
+parser.add_argument('--prompt_nonlocal_reduction', type=int, default=2,
+                    help='channel reduction ratio in prompt non-local mixer')
 
 ## eval
 parser.add_argument('--eval', type=int, default=0, help='evaluation or not')

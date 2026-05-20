@@ -3,6 +3,7 @@ import math
 from typing import Callable, Dict, Type
 import torch
 import torch.nn as nn
+from layers.Downstream_Adapters import TokenNonLocalBlock
 
 # ==========================================
 # 🚀 基础组件：融合 PointNet 思想的 Advanced SEBlock
@@ -35,8 +36,10 @@ class AdvancedSEBlock(nn.Module):
 # 🚀 基础组件：通用的动态提示词微扰预测器
 # ==========================================
 class GenericLocalDynamicsMLP(nn.Module):
-    def __init__(self, in_dim, hidden_dim=64, cond_dim=3):
+    def __init__(self, in_dim, hidden_dim=64, cond_dim=3, use_nonlocal=False,
+                 nonlocal_context=128, nonlocal_reduction=2):
         super().__init__()
+        self.use_nonlocal = bool(use_nonlocal)
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.act1 = nn.GELU()
@@ -46,6 +49,12 @@ class GenericLocalDynamicsMLP(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.act2 = nn.GELU()
+        if self.use_nonlocal:
+            self.nonlocal_mixer = TokenNonLocalBlock(
+                hidden_dim=hidden_dim,
+                reduction=nonlocal_reduction,
+                context_size=nonlocal_context,
+            )
 
         # 核心：输出维度不再硬编码为 3，而是和不同任务的 cond_dim 保持一致
         self.out = nn.Linear(hidden_dim, cond_dim)
@@ -69,6 +78,8 @@ class GenericLocalDynamicsMLP(nn.Module):
         h = self.fc2(h)
         h = self.norm2(h)
         h = self.act2(h)
+        if self.use_nonlocal:
+            h = self.nonlocal_mixer(h)
 
         deltas = self.out(h)  # [B, N, cond_dim]
         return deltas
@@ -79,10 +90,15 @@ class GenericLocalDynamicsMLP(nn.Module):
 # ================================================================
 
 class CraftDynamics(nn.Module):
-    def __init__(self):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
         super().__init__()
         # x: 7维, cond: 3维 -> in_dim = 10
-        self.mlp = GenericLocalDynamicsMLP(in_dim=10, hidden_dim=64, cond_dim=3)
+        self.mlp = GenericLocalDynamicsMLP(
+            in_dim=10, hidden_dim=64, cond_dim=3,
+            use_nonlocal=use_nonlocal,
+            nonlocal_context=nonlocal_context,
+            nonlocal_reduction=nonlocal_reduction,
+        )
 
         # ✅ 把 1/3.0 变成可学习参数（初始值就是 1/3.0，和原来一致）
         self.mach_scale = nn.Parameter(torch.tensor(1.0 / 3.0))
@@ -115,10 +131,15 @@ class CraftDynamics(nn.Module):
         return torch.cat([v, extra], dim=-1)
 
 class NasaDynamics(nn.Module):
-    def __init__(self):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
         super().__init__()
         # x: 7维, cond: 2维 (mach, aoa) -> in_dim = 9
-        self.mlp = GenericLocalDynamicsMLP(in_dim=9, hidden_dim=64, cond_dim=2)
+        self.mlp = GenericLocalDynamicsMLP(
+            in_dim=9, hidden_dim=64, cond_dim=2,
+            use_nonlocal=use_nonlocal,
+            nonlocal_context=nonlocal_context,
+            nonlocal_reduction=nonlocal_reduction,
+        )
 
         # 可学习缩放系数，初始值 1.6
         self.mach_scale = nn.Parameter(torch.tensor(1.6))
@@ -146,10 +167,15 @@ class NasaDynamics(nn.Module):
 
 
 class CrashDynamics(nn.Module):
-    def __init__(self):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
         super().__init__()
         # x: 7维, cond: 1维 (angle) -> in_dim = 8
-        self.mlp = GenericLocalDynamicsMLP(in_dim=8, hidden_dim=64, cond_dim=1)
+        self.mlp = GenericLocalDynamicsMLP(
+            in_dim=8, hidden_dim=64, cond_dim=1,
+            use_nonlocal=use_nonlocal,
+            nonlocal_context=nonlocal_context,
+            nonlocal_reduction=nonlocal_reduction,
+        )
 
         # 🌟 核心修改 1：将硬编码的 0.5 注册为全局可学习参数
         # 初始值设为 0.5 以保证与你之前的 Baseline 热启动状态完全一致
@@ -207,98 +233,107 @@ class CrashDynamics(nn.Module):
 #         extra = (0.3 * (~mask).to(dtype)).to(device=device)
 #         return torch.cat([v, extra], dim=-1)
 
-class HullDynamics(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.mlp = GenericLocalDynamicsMLP(in_dim=8, hidden_dim=64, cond_dim=1)
-
-        # 可学习基础速度（你已经做得很好）
-        self.learnable_base_speed = nn.Parameter(torch.tensor(0.3))
-
-        # 🌟 可学习水面阈值（强烈推荐！）
-        self.water_threshold = nn.Parameter(torch.tensor(0.17428))
-
-        # 🌟 可选：可学习软过渡宽度（让水面更平滑）
-        self.transition_width = nn.Parameter(torch.tensor(0.02))
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        b, n, _ = x.shape
-        device, dtype = x.device, x.dtype
-        if cond.dim() == 2:
-            cond = cond.unsqueeze(1)
-
-        deltas = self.mlp(x, cond)
-        cond_exp = cond.expand(-1, n, -1)
-        local_angle = cond_exp[..., :1] + deltas[..., :1]
-
-        vx = torch.cos(math.pi * local_angle / 180.0)
-        vy = torch.zeros(b, n, 1, device=device, dtype=dtype)
-        vz = torch.sin(math.pi * local_angle / 180.0)
-        v = torch.cat([vx, vy, vz], dim=-1).to(dtype)
-
-        # ========================
-        # 🌟 可学习软阈值掩码（核心改进）
-        # ========================
-        y = x[:, :, 1:2]  # 水面高度维度
-
-        # 软掩码：从水下 → 水上平滑过渡，不是硬阶梯
-        mask = torch.sigmoid(
-            (y - self.water_threshold) / self.transition_width.abs()
-        )
-
-        # 水下 = 1，水上 = 0
-        water_mask = 1.0 - mask
-
-        # 可学习速度 * 掩码
-        extra = self.learnable_base_speed * water_mask
-        extra = extra.to(device=device, dtype=dtype)
-
-        return torch.cat([v, extra], dim=-1)
-
 # class HullDynamics(nn.Module):
 #     def __init__(self):
 #         super().__init__()
-#         # 保持与第一版一样的输入维度 (纯几何 + 宏观角度)
 #         self.mlp = GenericLocalDynamicsMLP(in_dim=8, hidden_dim=64, cond_dim=1)
 #
-#         # 🌟 核心优化：将写死的 0.3 变成一个全局可学习的物理标量！
-#         # 初始值设为 0.3 保证热启动稳定，但在微调中它可以整体平移
+#         # 可学习基础速度（你已经做得很好）
 #         self.learnable_base_speed = nn.Parameter(torch.tensor(0.3))
+#
+#         # 🌟 可学习水面阈值（强烈推荐！）
+#         self.water_threshold = nn.Parameter(torch.tensor(0.17428))
+#
+#         # 🌟 可选：可学习软过渡宽度（让水面更平滑）
+#         self.transition_width = nn.Parameter(torch.tensor(0.02))
 #
 #     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
 #         b, n, _ = x.shape
 #         device, dtype = x.device, x.dtype
-#         if cond.dim() == 2: cond = cond.unsqueeze(1)
+#         if cond.dim() == 2:
+#             cond = cond.unsqueeze(1)
 #
-#         # 1. 依然只预测角度微扰 (因为几何外形确实会直接导致局部水流方向的偏转)
 #         deltas = self.mlp(x, cond)
 #         cond_exp = cond.expand(-1, n, -1)
 #         local_angle = cond_exp[..., :1] + deltas[..., :1]
 #
-#         # 2. 向量分解
 #         vx = torch.cos(math.pi * local_angle / 180.0)
 #         vy = torch.zeros(b, n, 1, device=device, dtype=dtype)
 #         vz = torch.sin(math.pi * local_angle / 180.0)
 #         v = torch.cat([vx, vy, vz], dim=-1).to(dtype)
 #
-#         # 3. 物理掩码 (水面上依然严格为0)
-#         thr = 0.17428
-#         mask = (x[:, :, 1] > thr).unsqueeze(-1)
+#         # ========================
+#         # 🌟 可学习软阈值掩码（核心改进）
+#         # ========================
+#         y = x[:, :, 1:2]  # 水面高度维度
 #
-#         # 🌟 4. 使用全局可学习参数代替硬编码 0.3
-#         # 这样既保证了先验流场的绝对平滑性，又给模型留下了解锁最佳尺度的自由度
-#         extra = (self.learnable_base_speed * (~mask).to(dtype)).to(device=device)
+#         # 软掩码：从水下 → 水上平滑过渡，不是硬阶梯
+#         mask = torch.sigmoid(
+#             (y - self.water_threshold) / self.transition_width.abs()
+#         )
+#
+#         # 水下 = 1，水上 = 0
+#         water_mask = 1.0 - mask
+#
+#         # 可学习速度 * 掩码
+#         extra = self.learnable_base_speed * water_mask
+#         extra = extra.to(device=device, dtype=dtype)
 #
 #         return torch.cat([v, extra], dim=-1)
 
+class HullDynamics(nn.Module):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
+        super().__init__()
+        self.mlp = GenericLocalDynamicsMLP(
+            in_dim=8, hidden_dim=64, cond_dim=1,
+            use_nonlocal=use_nonlocal,
+            nonlocal_context=nonlocal_context,
+            nonlocal_reduction=nonlocal_reduction,
+        )
+        self.learnable_base_speed = nn.Parameter(torch.tensor(0.3))
+        # 根据预处理中的 scale 和 shift，0.17428 确实是对应的真实吃水线！
+        self.water_threshold = nn.Parameter(torch.tensor(0.17428))
+        self.transition_width = nn.Parameter(torch.tensor(0.02))
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        b, n, _ = x.shape
+        device, dtype = x.device, x.dtype
+        if cond.dim() == 2: cond = cond.unsqueeze(1)
+
+        deltas = self.mlp(x, cond)
+        cond_exp = cond.expand(-1, n, -1)
+        local_angle = cond_exp[..., :1] + deltas[..., :1]
+
+        # 完美适配这套被原作者“魔改”的坐标系
+        vx = torch.cos(math.pi * local_angle / 180.0)
+        vy = torch.zeros(b, n, 1, device=device, dtype=dtype)  # y 是高度，设为 0
+        vz = torch.sin(math.pi * local_angle / 180.0)  # z 是横向，设为 sin
+        v = torch.cat([vx, vy, vz], dim=-1).to(dtype)
+
+        y_height = x[:, :, 1:2]  # index 1 确实是高度！
+
+        # 软掩码
+        width = torch.clamp(self.transition_width.abs(), min=1e-4, max=0.05)
+        mask = torch.sigmoid((y_height - self.water_threshold) / width)
+
+        water_mask = 1.0 - mask
+        extra = self.learnable_base_speed * water_mask
+
+        return torch.cat([v, extra.to(dtype)], dim=-1)
+
 
 class DrivAerMLDynamics(nn.Module):
-    def __init__(self):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
         super().__init__()
         # x: 7维 (几何特征)
         # cond: 2维 [weight, angle_degrees]
         # in_dim = 7 + 2 = 9
-        self.mlp = GenericLocalDynamicsMLP(in_dim=9, hidden_dim=64, cond_dim=2)
+        self.mlp = GenericLocalDynamicsMLP(
+            in_dim=9, hidden_dim=64, cond_dim=2,
+            use_nonlocal=use_nonlocal,
+            nonlocal_context=nonlocal_context,
+            nonlocal_reduction=nonlocal_reduction,
+        )
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         b, n, _ = x.shape
@@ -353,7 +388,7 @@ _ALIASES: Dict[str, str] = {
 }
 
 
-def get_direction(dynamics_config: str) -> nn.Module:
+def get_direction(dynamics_config: str, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2) -> nn.Module:
     """
     现在返回的是一个实例化的 nn.Module，内部自带参数和特化逻辑
     """
@@ -363,4 +398,8 @@ def get_direction(dynamics_config: str) -> nn.Module:
     if dynamics_config not in _REGISTRY:
         raise ValueError(f"Unknown dynamics_config='{dynamics_config}'. Supported: {list(_REGISTRY.keys())}")
 
-    return _REGISTRY[dynamics_config]()
+    return _REGISTRY[dynamics_config](
+        use_nonlocal=use_nonlocal,
+        nonlocal_context=nonlocal_context,
+        nonlocal_reduction=nonlocal_reduction,
+    )

@@ -24,7 +24,12 @@ class Exp_Steady(Exp_Basic):
         # 🚀 极其优雅的初始化：
         # 无论是什么任务，统一从 registry 获取特化的物理驱动器（内含 MLP 和 SEBlock 参数）
         # ==========================================
-        self.direction = get_direction(self.args.dynamics).cuda()
+        self.direction = get_direction(
+            self.args.dynamics,
+            use_nonlocal=bool(getattr(self.args, "use_prompt_nonlocal", 0)),
+            nonlocal_context=getattr(self.args, "prompt_nonlocal_context", 128),
+            nonlocal_reduction=getattr(self.args, "prompt_nonlocal_reduction", 2),
+        ).cuda()
         print(f"[Exp_Steady] Dynamics module '{self.args.dynamics}' loaded with unified prompt generator.")
 
     def vali(self):
@@ -148,52 +153,59 @@ class Exp_Steady(Exp_Basic):
                 main_loss = myloss(out, y)
 
                 # ==========================================
-                # 🚀 物理风场方向辅助监督 (精准适配各数据集坐标系)
+                # 🚀 物理风场方向辅助监督
                 # ==========================================
                 if self.args.dynamics in ['craft', 'hull', 'drivAerml']:
-                    # 1. 提取真实速度分量
                     if self.args.dynamics == 'craft':
-                        # AirCraft: 速度通道 2:5 [u, v, w], 无需变换
                         v_true = y[:, :, 2:5]
-
                     elif self.args.dynamics == 'drivAerml':
-                        # DrivAerML: 速度通道 1:4 [Ux, Uy, Uz], 无需变换
                         v_true = y[:, :, 1:4]
-
                     elif self.args.dynamics == 'hull':
-                        # 🌟 DTCHull 特化逻辑：同步执行预处理中的 Transform 变换
-                        # 原始速度通道 1:4 [Ux, Uy, Uz]
+                        # 保持轴变换，因为几何x是换过轴的，我们要把真实速度也换轴对齐
                         v_raw = y[:, :, 1:4]
-
-                        # 按照预处理脚本: new_x = -old_x, new_y = old_z, new_z = old_y
                         v_true = torch.zeros_like(v_raw)
-                        v_true[:, :, 0] = -v_raw[:, :, 0]  # 航向取反
-                        v_true[:, :, 1] = v_raw[:, :, 2]  # y轴取自原始z
-                        v_true[:, :, 2] = v_raw[:, :, 1]  # z轴取自原始y
+                        v_true[:, :, 0] = -v_raw[:, :, 0]
+                        v_true[:, :, 1] = v_raw[:, :, 2]
+                        v_true[:, :, 2] = v_raw[:, :, 1]
 
-                    # 2. 计算真实速度的单位方向向量
+                    # 🌟 修复 Bug：生成有效物理掩码 (过滤掉水面上速度为 0 的空气区)
+                    v_true_norm = torch.norm(v_true, p=2, dim=-1)
+                    valid_mask = (v_true_norm > 1e-3).float()
+
                     v_true_unit = torch.nn.functional.normalize(v_true, p=2, dim=-1, eps=1e-8)
+                    v_pred_unit = torch.nn.functional.normalize(v_pred_dir, p=2, dim=-1, eps=1e-8)
 
-                    # 3. 计算预测方向 (v_pred_dir) 与 真实方向 (v_true_unit) 的余弦相似度
-                    cos_sim = torch.sum(v_pred_dir * v_true_unit, dim=-1)
+                    cos_sim = torch.sum(v_pred_unit * v_true_unit, dim=-1)
 
-                    # 4. 计算辅助损失 (1 - cos_sim)
-                    direction_loss = torch.mean(1.0 - cos_sim)
+                    # 只在有效流体区 (valid_mask == 1) 算损失
+                    masked_direction_loss = (1.0 - cos_sim) * valid_mask
+                    valid_sum = torch.sum(valid_mask)
 
-                    # 5. 损失合并 (保持 1.0 权重)
-                    # loss = main_loss + 1.0 * direction_loss
+                    if valid_sum > 0:
+                        direction_loss = torch.sum(masked_direction_loss) / valid_sum
+                    else:
+                        direction_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
+
+                    # 4. 损失合并
                     if self.args.dynamics == 'craft':
                         loss = main_loss + 1.0 * direction_loss
                     elif self.args.dynamics == 'drivAerml':
                         loss = main_loss + 1.0 * direction_loss
                     elif self.args.dynamics == 'hull':
-                        loss = main_loss + 1.5 * direction_loss
+                        loss = main_loss + 0.0 * direction_loss
 
                     train_dir_loss += direction_loss.item()
 
                 else:
                     # 其他数据集（nasa, crash）维持原样
                     loss = main_loss
+
+                lambda_adapter = float(getattr(self.args, "lambda_adapter", 0.0))
+                adapter_reg = getattr(self.model, "last_adapter_reg", None)
+                if lambda_adapter > 0.0 and adapter_reg is not None:
+                    loss = loss + lambda_adapter * adapter_reg
+
+                train_loss += main_loss.item()
 
                 train_loss += main_loss.item()
 

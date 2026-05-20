@@ -6,6 +6,7 @@ from layers.Physics_Attention import Physics_Attention_Irregular_Mesh
 from layers.Physics_Attention import Physics_Attention_Structured_Mesh_1D
 from layers.Physics_Attention import Physics_Attention_Structured_Mesh_2D
 from layers.Physics_Attention import Physics_Attention_Structured_Mesh_3D
+from layers.Downstream_Adapters import ZeroInitConditionAdapter, ZeroInitOutputResidualHead
 import torch.utils.checkpoint as checkpoint
 
 PHYSICS_ATTENTION = {
@@ -215,6 +216,36 @@ class Model(nn.Module):
                                                       eidetic_gumbel=bool(getattr(args, 'eidetic_gumbel', 0)),
                                                       eidetic_hard=bool(getattr(args, 'eidetic_hard', 0)))
                                      for _ in range(args.n_layers)])
+        self.use_condition_adapter = bool(getattr(args, 'use_condition_adapter', 0))
+        self.adapter_condition_source = getattr(args, 'adapter_condition_source', 'x_fx')
+        self.adapter_layers = self._parse_adapter_layers(getattr(args, 'adapter_layers', '1,3,5'))
+        self.condition_adapters = nn.ModuleDict()
+        if self.use_condition_adapter:
+            adapter_cond_dim = self._adapter_condition_dim()
+            self.condition_adapters = nn.ModuleDict({
+                str(layer_idx): ZeroInitConditionAdapter(
+                    cond_dim=adapter_cond_dim,
+                    hidden_dim=getattr(args, 'adapter_hidden_dim', args.n_hidden // 2),
+                    model_dim=args.n_hidden,
+                )
+                for layer_idx in self.adapter_layers
+            })
+
+        self.use_output_residual_head = bool(getattr(args, 'use_output_residual_head', 0))
+        if self.use_output_residual_head:
+            if args.fun_dim <= 0:
+                raise ValueError("use_output_residual_head requires fun_dim > 0.")
+            self.output_residual_head = ZeroInitOutputResidualHead(
+                hidden_dim=args.n_hidden,
+                point_dim=args.space_dim,
+                feature_dim=args.fun_dim,
+                out_dim=args.out_dim,
+                residual_hidden_dim=getattr(args, 'output_residual_hidden', args.n_hidden),
+            )
+        else:
+            self.output_residual_head = None
+        self.last_adapter_reg = None
+        self.last_output_residual_norm = None
         self.placeholder = nn.Parameter((1 / (args.n_hidden)) * torch.rand(args.n_hidden, dtype=torch.float))
         self.initialize_weights()
         self.reset_experiment_adapters()
@@ -238,6 +269,8 @@ class Model(nn.Module):
             if hasattr(module, 'token_gate'):
                 nn.init.zeros_(module.token_gate[-2].weight)
                 nn.init.zeros_(module.token_gate[-2].bias)
+            if isinstance(module, (ZeroInitConditionAdapter, ZeroInitOutputResidualHead)):
+                module.reset_parameters()
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -248,10 +281,80 @@ class Model(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def structured_geo(self, x, fx):
+    def _parse_adapter_layers(self, layer_spec):
+        if isinstance(layer_spec, str):
+            layers = [int(item.strip()) for item in layer_spec.split(',') if item.strip()]
+        else:
+            layers = [int(item) for item in layer_spec]
+        max_hidden_layer = max(0, len(self.blocks) - 2)
+        return sorted({layer for layer in layers if 0 <= layer <= max_hidden_layer})
+
+    def _adapter_condition_dim(self):
+        if self.adapter_condition_source == 'x':
+            return self.args.space_dim
+        if self.adapter_condition_source == 'fx':
+            if self.args.fun_dim <= 0:
+                raise ValueError("adapter_condition_source='fx' requires fun_dim > 0.")
+            return self.args.fun_dim
+        if self.adapter_condition_source == 'x_fx':
+            if self.args.fun_dim <= 0:
+                raise ValueError("adapter_condition_source='x_fx' requires fun_dim > 0.")
+            return self.args.space_dim + self.args.fun_dim
+        raise ValueError("adapter_condition_source must be one of ['x', 'fx', 'x_fx'].")
+
+    def _build_adapter_condition(self, x, fx):
+        if not self.use_condition_adapter:
+            return None
+        if self.adapter_condition_source == 'x':
+            return x
+        if fx is None:
+            fx = x.new_zeros(x.shape[0], x.shape[1], self.args.fun_dim)
+        if self.adapter_condition_source == 'fx':
+            return fx
+        return torch.cat([x, fx], dim=-1)
+
+    def _run_blocks(self, hidden, geo_context=None, adapter_cond=None, return_hidden=False):
+        reg_terms = []
+        penultimate = hidden
+        for idx, block in enumerate(self.blocks):
+            if idx == len(self.blocks) - 1:
+                penultimate = hidden
+            if self.args.checkpoint:
+                if geo_context is None:
+                    hidden = checkpoint.checkpoint(block, hidden)
+                else:
+                    hidden = checkpoint.checkpoint(block, hidden, geo_context)
+            else:
+                hidden = block(hidden, geo_context)
+
+            if adapter_cond is not None and idx < len(self.blocks) - 1 and str(idx) in self.condition_adapters:
+                hidden, delta = self.condition_adapters[str(idx)](hidden, adapter_cond, return_delta=True)
+                reg_terms.append(delta.pow(2).mean())
+
+        if reg_terms:
+            self.last_adapter_reg = torch.stack(reg_terms).mean()
+        else:
+            self.last_adapter_reg = hidden.new_tensor(0.0)
+        if return_hidden:
+            return hidden, penultimate
+        return hidden
+
+    def _apply_output_residual(self, out, penultimate, x, fx):
+        self.last_output_residual_norm = out.new_tensor(0.0)
+        if self.output_residual_head is None:
+            return out
+        if fx is None:
+            fx = x.new_zeros(x.shape[0], x.shape[1], self.args.fun_dim)
+        delta = self.output_residual_head(penultimate, x, fx, return_delta=True)
+        self.last_output_residual_norm = delta.pow(2).mean()
+        return out + delta
+
+    def structured_geo(self, x, fx, return_hidden=False):
         if self.args.unified_pos:
             x = self.pos.repeat(x.shape[0], 1, 1)
+        raw_fx = fx
         geo_context = self.geo_context(x, fx) if self.geo_context is not None else None
+        adapter_cond = self._build_adapter_condition(x, raw_fx)
         if fx is not None:
             fx = torch.cat((x, fx), -1)
             fx = self.preprocess(fx)
@@ -259,18 +362,16 @@ class Model(nn.Module):
             fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
 
-        for block in self.blocks:
-            if self.args.checkpoint:
-                if geo_context is None:
-                    fx = checkpoint.checkpoint(block, fx)
-                else:
-                    fx = checkpoint.checkpoint(block, fx, geo_context)
-            else:
-                fx = block(fx, geo_context)
-        return fx
+        out, penultimate = self._run_blocks(fx, geo_context, adapter_cond, return_hidden=True)
+        out = self._apply_output_residual(out, penultimate, x, raw_fx)
+        if return_hidden:
+            return out, penultimate
+        return out
 
-    def unstructured_geo(self, x, fx):
+    def unstructured_geo(self, x, fx, return_hidden=False):
+        raw_fx = fx
         geo_context = self.geo_context(x, fx) if self.geo_context is not None else None
+        adapter_cond = self._build_adapter_condition(x, raw_fx)
         if fx is not None:
             fx = torch.cat((x, fx), -1)
             fx = self.preprocess(fx)
@@ -278,18 +379,14 @@ class Model(nn.Module):
             fx = self.preprocess(x)
         fx = fx + self.placeholder[None, None, :]
 
-        for block in self.blocks:
-            if self.args.checkpoint:
-                if geo_context is None:
-                    fx = checkpoint.checkpoint(block, fx)
-                else:
-                    fx = checkpoint.checkpoint(block, fx, geo_context)
-            else:
-                fx = block(fx, geo_context)
-        return fx
+        out, penultimate = self._run_blocks(fx, geo_context, adapter_cond, return_hidden=True)
+        out = self._apply_output_residual(out, penultimate, x, raw_fx)
+        if return_hidden:
+            return out, penultimate
+        return out
 
-    def forward(self, x, fx):
+    def forward(self, x, fx, return_hidden=False):
         if self.args.geotype == 'unstructured':
-            return self.unstructured_geo(x, fx)
+            return self.unstructured_geo(x, fx, return_hidden=return_hidden)
         else:
-            return self.structured_geo(x, fx)
+            return self.structured_geo(x, fx, return_hidden=return_hidden)
