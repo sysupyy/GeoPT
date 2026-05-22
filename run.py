@@ -92,6 +92,19 @@ parser.add_argument('--prompt_nonlocal_context', type=int, default=128,
                     help='number of context tokens sampled by prompt non-local mixer')
 parser.add_argument('--prompt_nonlocal_reduction', type=int, default=2,
                     help='channel reduction ratio in prompt non-local mixer')
+parser.add_argument('--prompt_hidden_dim', type=int, default=64,
+                    help='hidden width of the prompt correction MLP')
+parser.add_argument('--prompt_se_mode', type=str, default='legacy',
+                    choices=['legacy', 'multi'],
+                    help='SE block used in the prompt correction MLP')
+parser.add_argument('--prompt_se_reduction', type=int, default=4,
+                    help='channel reduction ratio for multi-stat prompt SE')
+parser.add_argument('--prompt_se_point_gate', type=int, default=0,
+                    help='enable point-wise gate in multi-stat prompt SE')
+parser.add_argument('--prompt_se_depth', type=int, default=1,
+                    help='number of SE insertions in prompt MLP; multi mode supports 1 or 2')
+parser.add_argument('--prompt_se_dropout', type=float, default=0.0,
+                    help='dropout inside multi-stat prompt SE')
 
 ## eval
 parser.add_argument('--eval', type=int, default=0, help='evaluation or not')

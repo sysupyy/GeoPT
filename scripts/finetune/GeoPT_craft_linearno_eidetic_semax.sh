@@ -1,5 +1,5 @@
 python run.py \
---gpu 2 \
+--gpu 1 \
 --data_path ./aircraft_npys \
 --loader AirCraft \
 --task GeoPT_finetune \
@@ -15,11 +15,21 @@ python run.py \
 --n_layers 8 \
 --mlp_ratio 2 \
 --slice_num 32 \
+--physics_mixer linearno \
+--use_eidetic_slice 1 \
+--eidetic_min_temp 0.01 \
+--eidetic_gumbel 0 \
+--prompt_hidden_dim 128 \
+--prompt_se_mode multi \
+--prompt_se_reduction 2 \
+--prompt_se_point_gate 1 \
+--prompt_se_depth 2 \
+--prompt_se_dropout 0.0 \
 --ntrain 100 \
 --ntest 50 \
 --batch-size 1 \
 --epochs 200 \
 --eval 0 \
---save_name craft_geopt_8layers_linearno \
+--save_name craft_geopt_8layers_linearno_eidetic_semax \
 --finetune 1 \
 --finetune_name GeoPT_8layers

@@ -32,19 +32,87 @@ class AdvancedSEBlock(nn.Module):
         return x * y
 
 
+class MultiStatPromptSEBlock(nn.Module):
+    def __init__(self, channel, cond_dim=3, reduction=4, point_gate=False, dropout=0.0):
+        super().__init__()
+        bottleneck = max(8, channel // max(1, reduction))
+        self.point_gate = bool(point_gate)
+        self.channel_gate = nn.Sequential(
+            nn.LayerNorm(channel * 4 + cond_dim),
+            nn.Linear(channel * 4 + cond_dim, bottleneck, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(bottleneck, channel, bias=True),
+        )
+        if self.point_gate:
+            self.point_gate_net = nn.Sequential(
+                nn.LayerNorm(channel),
+                nn.Linear(channel, bottleneck),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(bottleneck, 1),
+            )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.channel_gate[-1].weight)
+        nn.init.zeros_(self.channel_gate[-1].bias)
+        if self.point_gate:
+            nn.init.zeros_(self.point_gate_net[-1].weight)
+            nn.init.zeros_(self.point_gate_net[-1].bias)
+
+    def forward(self, x, cond):
+        x_mean = x.mean(dim=1, keepdim=True)
+        x_max = x.max(dim=1, keepdim=True)[0]
+        x_std = x.std(dim=1, keepdim=True, unbiased=False)
+        x_min = x.min(dim=1, keepdim=True)[0]
+        if cond.dim() == 2:
+            cond = cond.unsqueeze(1)
+        global_desc = torch.cat([x_mean, x_max, x_std, x_min, cond], dim=-1)
+        channel_scale = 2.0 * torch.sigmoid(self.channel_gate(global_desc))
+        out = x * channel_scale
+        self.saved_attention = channel_scale.detach()
+        if self.point_gate:
+            point_scale = 2.0 * torch.sigmoid(self.point_gate_net(x))
+            out = out * point_scale
+            self.saved_point_attention = point_scale.detach()
+        return out
+
+
 # ==========================================
 # 🚀 基础组件：通用的动态提示词微扰预测器
 # ==========================================
 class GenericLocalDynamicsMLP(nn.Module):
     def __init__(self, in_dim, hidden_dim=64, cond_dim=3, use_nonlocal=False,
-                 nonlocal_context=128, nonlocal_reduction=2):
+                 nonlocal_context=128, nonlocal_reduction=2, se_mode="legacy",
+                 se_reduction=4, se_point_gate=False, se_depth=1, se_dropout=0.0):
         super().__init__()
         self.use_nonlocal = bool(use_nonlocal)
+        self.se_mode = se_mode
         self.fc1 = nn.Linear(in_dim, hidden_dim)
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.act1 = nn.GELU()
 
-        self.se = AdvancedSEBlock(channel=hidden_dim, cond_dim=cond_dim, reduction=4)
+        if self.se_mode == "legacy":
+            self.se = AdvancedSEBlock(channel=hidden_dim, cond_dim=cond_dim, reduction=4)
+            self.se2 = None
+        elif self.se_mode == "multi":
+            self.se = MultiStatPromptSEBlock(
+                channel=hidden_dim,
+                cond_dim=cond_dim,
+                reduction=se_reduction,
+                point_gate=se_point_gate,
+                dropout=se_dropout,
+            )
+            self.se2 = MultiStatPromptSEBlock(
+                channel=hidden_dim,
+                cond_dim=cond_dim,
+                reduction=se_reduction,
+                point_gate=se_point_gate,
+                dropout=se_dropout,
+            ) if int(se_depth) >= 2 else None
+        else:
+            raise ValueError("se_mode must be one of ['legacy', 'multi'].")
 
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
@@ -78,6 +146,8 @@ class GenericLocalDynamicsMLP(nn.Module):
         h = self.fc2(h)
         h = self.norm2(h)
         h = self.act2(h)
+        if self.se2 is not None:
+            h = self.se2(h, cond)
         if self.use_nonlocal:
             h = self.nonlocal_mixer(h)
 
@@ -90,14 +160,21 @@ class GenericLocalDynamicsMLP(nn.Module):
 # ================================================================
 
 class CraftDynamics(nn.Module):
-    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2,
+                 prompt_hidden_dim=64, prompt_se_mode="legacy", prompt_se_reduction=4,
+                 prompt_se_point_gate=False, prompt_se_depth=1, prompt_se_dropout=0.0):
         super().__init__()
         # x: 7维, cond: 3维 -> in_dim = 10
         self.mlp = GenericLocalDynamicsMLP(
-            in_dim=10, hidden_dim=64, cond_dim=3,
+            in_dim=10, hidden_dim=prompt_hidden_dim, cond_dim=3,
             use_nonlocal=use_nonlocal,
             nonlocal_context=nonlocal_context,
             nonlocal_reduction=nonlocal_reduction,
+            se_mode=prompt_se_mode,
+            se_reduction=prompt_se_reduction,
+            se_point_gate=prompt_se_point_gate,
+            se_depth=prompt_se_depth,
+            se_dropout=prompt_se_dropout,
         )
 
         # ✅ 把 1/3.0 变成可学习参数（初始值就是 1/3.0，和原来一致）
@@ -131,14 +208,21 @@ class CraftDynamics(nn.Module):
         return torch.cat([v, extra], dim=-1)
 
 class NasaDynamics(nn.Module):
-    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2,
+                 prompt_hidden_dim=64, prompt_se_mode="legacy", prompt_se_reduction=4,
+                 prompt_se_point_gate=False, prompt_se_depth=1, prompt_se_dropout=0.0):
         super().__init__()
         # x: 7维, cond: 2维 (mach, aoa) -> in_dim = 9
         self.mlp = GenericLocalDynamicsMLP(
-            in_dim=9, hidden_dim=64, cond_dim=2,
+            in_dim=9, hidden_dim=prompt_hidden_dim, cond_dim=2,
             use_nonlocal=use_nonlocal,
             nonlocal_context=nonlocal_context,
             nonlocal_reduction=nonlocal_reduction,
+            se_mode=prompt_se_mode,
+            se_reduction=prompt_se_reduction,
+            se_point_gate=prompt_se_point_gate,
+            se_depth=prompt_se_depth,
+            se_dropout=prompt_se_dropout,
         )
 
         # 可学习缩放系数，初始值 1.6
@@ -167,14 +251,21 @@ class NasaDynamics(nn.Module):
 
 
 class CrashDynamics(nn.Module):
-    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2,
+                 prompt_hidden_dim=64, prompt_se_mode="legacy", prompt_se_reduction=4,
+                 prompt_se_point_gate=False, prompt_se_depth=1, prompt_se_dropout=0.0):
         super().__init__()
         # x: 7维, cond: 1维 (angle) -> in_dim = 8
         self.mlp = GenericLocalDynamicsMLP(
-            in_dim=8, hidden_dim=64, cond_dim=1,
+            in_dim=8, hidden_dim=prompt_hidden_dim, cond_dim=1,
             use_nonlocal=use_nonlocal,
             nonlocal_context=nonlocal_context,
             nonlocal_reduction=nonlocal_reduction,
+            se_mode=prompt_se_mode,
+            se_reduction=prompt_se_reduction,
+            se_point_gate=prompt_se_point_gate,
+            se_depth=prompt_se_depth,
+            se_dropout=prompt_se_dropout,
         )
 
         # 🌟 核心修改 1：将硬编码的 0.5 注册为全局可学习参数
@@ -282,13 +373,20 @@ class CrashDynamics(nn.Module):
 #         return torch.cat([v, extra], dim=-1)
 
 class HullDynamics(nn.Module):
-    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2,
+                 prompt_hidden_dim=64, prompt_se_mode="legacy", prompt_se_reduction=4,
+                 prompt_se_point_gate=False, prompt_se_depth=1, prompt_se_dropout=0.0):
         super().__init__()
         self.mlp = GenericLocalDynamicsMLP(
-            in_dim=8, hidden_dim=64, cond_dim=1,
+            in_dim=8, hidden_dim=prompt_hidden_dim, cond_dim=1,
             use_nonlocal=use_nonlocal,
             nonlocal_context=nonlocal_context,
             nonlocal_reduction=nonlocal_reduction,
+            se_mode=prompt_se_mode,
+            se_reduction=prompt_se_reduction,
+            se_point_gate=prompt_se_point_gate,
+            se_depth=prompt_se_depth,
+            se_dropout=prompt_se_dropout,
         )
         self.learnable_base_speed = nn.Parameter(torch.tensor(0.3))
         # 根据预处理中的 scale 和 shift，0.17428 确实是对应的真实吃水线！
@@ -323,16 +421,23 @@ class HullDynamics(nn.Module):
 
 
 class DrivAerMLDynamics(nn.Module):
-    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2):
+    def __init__(self, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2,
+                 prompt_hidden_dim=64, prompt_se_mode="legacy", prompt_se_reduction=4,
+                 prompt_se_point_gate=False, prompt_se_depth=1, prompt_se_dropout=0.0):
         super().__init__()
         # x: 7维 (几何特征)
         # cond: 2维 [weight, angle_degrees]
         # in_dim = 7 + 2 = 9
         self.mlp = GenericLocalDynamicsMLP(
-            in_dim=9, hidden_dim=64, cond_dim=2,
+            in_dim=9, hidden_dim=prompt_hidden_dim, cond_dim=2,
             use_nonlocal=use_nonlocal,
             nonlocal_context=nonlocal_context,
             nonlocal_reduction=nonlocal_reduction,
+            se_mode=prompt_se_mode,
+            se_reduction=prompt_se_reduction,
+            se_point_gate=prompt_se_point_gate,
+            se_depth=prompt_se_depth,
+            se_dropout=prompt_se_dropout,
         )
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
@@ -388,7 +493,9 @@ _ALIASES: Dict[str, str] = {
 }
 
 
-def get_direction(dynamics_config: str, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2) -> nn.Module:
+def get_direction(dynamics_config: str, use_nonlocal=False, nonlocal_context=128, nonlocal_reduction=2,
+                  prompt_hidden_dim=64, prompt_se_mode="legacy", prompt_se_reduction=4,
+                  prompt_se_point_gate=False, prompt_se_depth=1, prompt_se_dropout=0.0) -> nn.Module:
     """
     现在返回的是一个实例化的 nn.Module，内部自带参数和特化逻辑
     """
@@ -402,4 +509,10 @@ def get_direction(dynamics_config: str, use_nonlocal=False, nonlocal_context=128
         use_nonlocal=use_nonlocal,
         nonlocal_context=nonlocal_context,
         nonlocal_reduction=nonlocal_reduction,
+        prompt_hidden_dim=prompt_hidden_dim,
+        prompt_se_mode=prompt_se_mode,
+        prompt_se_reduction=prompt_se_reduction,
+        prompt_se_point_gate=prompt_se_point_gate,
+        prompt_se_depth=prompt_se_depth,
+        prompt_se_dropout=prompt_se_dropout,
     )

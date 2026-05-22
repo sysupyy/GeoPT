@@ -1,5 +1,5 @@
 python run.py \
---gpu 1 \
+--gpu 2 \
 --data_path ./aircraft_npys \
 --loader AirCraft \
 --task GeoPT_finetune \

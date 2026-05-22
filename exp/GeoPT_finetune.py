@@ -29,6 +29,12 @@ class Exp_Steady(Exp_Basic):
             use_nonlocal=bool(getattr(self.args, "use_prompt_nonlocal", 0)),
             nonlocal_context=getattr(self.args, "prompt_nonlocal_context", 128),
             nonlocal_reduction=getattr(self.args, "prompt_nonlocal_reduction", 2),
+            prompt_hidden_dim=getattr(self.args, "prompt_hidden_dim", 64),
+            prompt_se_mode=getattr(self.args, "prompt_se_mode", "legacy"),
+            prompt_se_reduction=getattr(self.args, "prompt_se_reduction", 4),
+            prompt_se_point_gate=bool(getattr(self.args, "prompt_se_point_gate", 0)),
+            prompt_se_depth=getattr(self.args, "prompt_se_depth", 1),
+            prompt_se_dropout=getattr(self.args, "prompt_se_dropout", 0.0),
         ).cuda()
         print(f"[Exp_Steady] Dynamics module '{self.args.dynamics}' loaded with unified prompt generator.")
 
@@ -207,8 +213,6 @@ class Exp_Steady(Exp_Basic):
 
                 train_loss += main_loss.item()
 
-                train_loss += main_loss.item()
-
                 optimizer.zero_grad()
                 loss.backward()
 
@@ -271,9 +275,8 @@ class Exp_Steady(Exp_Basic):
         import math
         import torch
         import numpy as np
-        from utils.visual import visual, visual_deltas, visual_cosine_similarity, visual_cos_sim_diff, \
-            visual_se_attention
-        from utils.loss import L2Loss  # 假设 L2Loss 在这里，请按你原有的 import 调整
+        from utils.visual import visual, visual_deltas, visual_se_attention
+        from utils.loss import L2Loss
 
         checkpoint = torch.load("./checkpoints/" + self.args.save_name + ".pt")
         # ⚠️ 加上 strict=False，防止加载带有额外门控/LoRA结构的模型时报错
@@ -343,26 +346,36 @@ class Exp_Steady(Exp_Basic):
                     visual_deltas(x[:, :, :3], true_physical_deltas, self.args, id)
 
                 # ---------------------------------------------------------
-                # 可视化 2: 综合绘制余弦相似度的绝对大小与提升量
+                # 可视化 2: 综合绘制余弦相似度的绝对大小与提升量 (附带维度安全检测)
                 if id <= self.args.vis_num:
-                    # 依然使用我们验证过正确的、归一化后的 y 空间
-                    if self.args.dynamics == 'craft':
+                    has_velocity_gt = False
+
+                    # 检查 y 的维度是否包含速度场
+                    if self.args.dynamics == 'craft' and y.shape[-1] >= 5:
                         gt_v = y[..., 2:5]
-                    else:
+                        has_velocity_gt = True
+                    elif self.args.dynamics != 'craft' and y.shape[-1] >= 4:
                         gt_v = y[..., 1:4]
+                        has_velocity_gt = True
 
-                    from utils.visual import visual_cosine_similarity, visual_cos_sim_diff
+                    if has_velocity_gt:
+                        from utils.visual import visual_cosine_similarity, visual_cos_sim_diff
 
-                    print(f'\nvisual absolute cosine similarity: {id}')
-                    # 画出 Baseline 的绝对余弦相似度 (PDF)
-                    visual_cosine_similarity(x[:, :, :3], v_baseline, gt_v, self.args, id, suffix="baseline")
+                        print(f'\nvisual absolute cosine similarity: {id}')
+                        # 画出 Baseline 的绝对余弦相似度 (PDF)
+                        visual_cosine_similarity(x[:, :, :3], v_baseline, gt_v, self.args, id, suffix="baseline")
 
-                    # 画出 Ours (引入SE-MLP后) 的绝对余弦相似度 (PDF)
-                    visual_cosine_similarity(x[:, :, :3], v_ours, gt_v, self.args, id, suffix="ours")
+                        # 画出 Ours (引入SE-MLP后) 的绝对余弦相似度 (PDF)
+                        visual_cosine_similarity(x[:, :, :3], v_ours, gt_v, self.args, id, suffix="ours")
 
-                    print(f'visual cos sim diff: {id}')
-                    # 画出 Ours 相比 Baseline 的差值提升图 (PDF)
-                    visual_cos_sim_diff(x[:, :, :3], v_baseline, v_ours, gt_v, self.args, id)
+                        print(f'visual cos sim diff: {id}')
+                        # 画出 Ours 相比 Baseline 的差值提升图 (PDF)
+                        visual_cos_sim_diff(x[:, :, :3], v_baseline, v_ours, gt_v, self.args, id)
+                    else:
+                        if id == 1:
+                            # 仅在第一张图时打印提示，避免刷屏
+                            print(
+                                f"\n⚠️ [提示] 真实标签 y 的总通道数为 {y.shape[-1]}，没有真实的 3D 速度场数据。自动跳过速度余弦相似度可视化。")
                 # ---------------------------------------------------------
 
                 # 🌟 2. 收集 SE 探针数据
@@ -418,8 +431,13 @@ class Exp_Steady(Exp_Basic):
                 print("[Warning] 未找到 visual_se_attention 函数，请确保已在 utils/visual.py 中添加！")
 
     def test_full_mesh(self):
+        import os
+        import torch
+        from utils.visual import visual
+        from utils.loss import L2Loss
+
         checkpoint = torch.load("./checkpoints/" + self.args.save_name + ".pt")
-        self.model.load_state_dict(checkpoint['model'])
+        self.model.load_state_dict(checkpoint['model'], strict=False)
 
         if 'direction' in checkpoint:
             self.direction.load_state_dict(checkpoint['direction'])
@@ -453,7 +471,7 @@ class Exp_Steady(Exp_Basic):
                 out = self.model(x[:, :, :3], fx)
                 if self.args.normalize:
                     out = self.dataset.y_normalizer.decode(out)
- 
+
                 tl = myloss(out, y).item()
                 mse += (out - y).pow(2).mean(dim=1).mean(dim=1).sum().item()
                 mae += torch.abs(out - y).mean(dim=1).mean(dim=1).sum().item()
